@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# DNS DoQ Benchmark Script (using dnsproxy)
+# DNS DoQ Benchmark Script (Direct resolver queries - bypasses local caching)
 # Usage: bash dns_doq_benchmark.sh [queries] [concurrent_threads]
 
 QUERIES=${1:-100}
 THREADS=${2:-5}
-TEST_DOMAINS=("example.com" "google.com" "cloudflare.com")
+TEST_DOMAINS=("example.com" "google.com" "cloudflare.com" "wikipedia.org" "github.com")
 
 declare -a RESOLVERS=(
     "quic://dns.adguard-dns.com"
@@ -43,34 +43,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-echo -e "${BLUE}=== DNS DoQ Benchmark Suite ===${NC}"
+echo -e "${BLUE}=== DNS DoQ Benchmark Suite (Direct Resolver Queries) ===${NC}"
 echo "Queries per resolver: $QUERIES"
 echo "Concurrent threads: $THREADS"
+echo "Domains: ${TEST_DOMAINS[@]}"
 echo ""
 
-# Install dnsproxy if missing
-if ! command -v dnsproxy &> /dev/null; then
-    echo -e "${YELLOW}[*] Installing dnsproxy...${NC}"
-    
-    # Detect architecture
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) ARCH="amd64" ;;
-        aarch64) ARCH="arm64" ;;
-        armv7l) ARCH="arm" ;;
-    esac
-    
-    # Download latest release
-    LATEST=$(curl -s https://api.github.com/repos/AdguardTeam/dnsproxy/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)
-    VERSION=${LATEST#v}
-    
-    echo "Downloading dnsproxy $VERSION..."
-    cd /tmp
-    wget -q https://github.com/AdguardTeam/dnsproxy/releases/download/$LATEST/dnsproxy-linux-${ARCH}-$VERSION.tar.gz
-    tar -xzf dnsproxy-linux-${ARCH}-$VERSION.tar.gz
-    mv dnsproxy /usr/local/bin/
-    chmod +x /usr/local/bin/dnsproxy
-    rm -f dnsproxy-linux-${ARCH}-$VERSION.tar.gz
+# Install drill (ldns) if missing - better for direct DoQ queries
+if ! command -v drill &> /dev/null; then
+    echo -e "${YELLOW}[*] Installing ldns-tools (drill)...${NC}"
+    apt-get update -qq 2>/dev/null
+    apt-get install -y ldns-tools -qq 2>/dev/null
 fi
 
 echo -e "${BLUE}[*] Running benchmarks...${NC}"
@@ -78,6 +61,11 @@ echo ""
 
 benchmark_resolver() {
     local resolver=$1
+    local host="${resolver#quic://}"
+    host="${host%:*}"
+    local port="${resolver##*:}"
+    [[ "$port" == "$host" ]] && port="853"
+    
     local success=0
     local failures=0
     local timings=()
@@ -88,13 +76,16 @@ benchmark_resolver() {
         
         (
             start_ns=$(date +%s%N)
-            timeout 6 dnsproxy -u "$resolver" -b "127.0.0.1:0" "$domain" A > /dev/null 2>&1
+            
+            # Use drill with explicit resolver and DoQ (port 853)
+            # drill queries the specific resolver directly
+            timeout 6 drill -D @$host -p $port $domain A > /dev/null 2>&1
             result=$?
+            
             end_ns=$(date +%s%N)
             elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
             
-            # Only count success if dnsproxy returned 0 (or timeout is >5s = network issue, not query fail)
-            if [ $result -eq 0 ] || [ $elapsed_ms -lt 6000 ]; then
+            if [ $result -eq 0 ]; then
                 echo "1:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
             else
                 echo "0:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
@@ -179,9 +170,9 @@ benchmark_resolver() {
     
     # Color output based on success
     if [ "$success" -gt 0 ]; then
-        printf "${GREEN}✓${NC} [%-30s] %3d/%d | avg: %6.1fms | p95: %6.1fms | p99: %6.1fms\n" "$resolver" "$success" "$QUERIES" "$avg" "$p95" "$p99"
+        printf "${GREEN}✓${NC} [%-35s] %3d/%d | avg: %6.1fms | p95: %6.1fms | p99: %6.1fms | stdev: %5.2f\n" "$resolver" "$success" "$QUERIES" "$avg" "$p95" "$p99" "$stdev"
     else
-        printf "${RED}✗${NC} [%-30s] %3d/%d | FAILED\n" "$resolver" "$success" "$QUERIES"
+        printf "${RED}✗${NC} [%-35s] %3d/%d | FAILED\n" "$resolver" "$success" "$QUERIES"
     fi
     
     echo "$resolver,$QUERIES,$success,$failures,$success_rate,$avg,$p50,$p95,$p99,$stdev"
@@ -203,5 +194,5 @@ echo ""
 echo -e "${GREEN}✓ Benchmark complete!${NC}"
 echo "Results: $RESULTS_FILE"
 echo ""
-echo "Top 10 by latency:"
-tail -n +2 "$RESULTS_FILE" | awk -F',' '$3 > 0' | sort -t',' -k6 -n | head -10 | awk -F',' '{printf "%-30s %3d/%d | %7.2fms avg | %7.2fms p95 | %6.1f%%\n", $1, $3, $2, $6, $8, $5}'
+echo "Top 10 by latency (100% success only):"
+tail -n +2 "$RESULTS_FILE" | awk -F',' '$3 == $2 {print}' | sort -t',' -k6 -n | head -10 | awk -F',' '{printf "%-35s %3d/%d | %7.2fms avg | %7.2fms p95 | %7.2fms p99 | %5.2f stdev\n", $1, $3, $2, $6, $8, $9, $10}'
