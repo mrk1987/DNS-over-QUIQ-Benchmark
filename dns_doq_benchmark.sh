@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# DNS DoQ Benchmark Script
+# DNS DoQ Benchmark Script (Fixed - uses dnspython for proper DoQ)
 # Usage: bash dns_doq_benchmark.sh [queries] [concurrent_threads] [timeout_ms]
 # Default: 100 queries, 5 threads, 5000ms timeout
 
@@ -54,23 +54,19 @@ echo ""
 
 # Check dependencies
 check_deps() {
-    local missing=0
-    
-    if ! command -v dig &> /dev/null; then
-        echo -e "${RED}[!] dig not found${NC}"
-        missing=1
-    fi
+    echo -e "${BLUE}[*] Checking dependencies...${NC}"
     
     if ! command -v python3 &> /dev/null; then
-        echo -e "${RED}[!] python3 not found${NC}"
-        missing=1
+        echo -e "${RED}[!] python3 not found, installing...${NC}"
+        apt-get update -qq
+        apt-get install -y python3 python3-pip > /dev/null 2>&1
     fi
     
-    if [ $missing -eq 1 ]; then
-        echo -e "${YELLOW}Installing dependencies...${NC}"
-        apt-get update -qq
-        apt-get install -y dnsutils python3 python3-pip > /dev/null 2>&1
-        pip3 install dnspython requests --quiet 2>/dev/null || true
+    # Install dnspython
+    python3 -c "import dns.quic" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}[*] Installing dnspython...${NC}"
+        pip3 install dnspython --quiet
     fi
 }
 
@@ -100,16 +96,17 @@ echo ""
 echo -e "${BLUE}[*] Running benchmarks (this may take a few minutes)...${NC}"
 echo ""
 
-# Python benchmark script (embedded)
+# Python benchmark script using dnspython for proper DoQ
 python3 << 'PYTHON_SCRIPT'
-import subprocess
-import json
-import csv
+import asyncio
 import time
+import csv
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from statistics import median, stdev, mean
-import os
+import dns.quic
+import dns.rdatatype
+import dns.name
 
 RESOLVERS = [
     "dns.adguard-dns.com",
@@ -144,53 +141,54 @@ RESULTS_FILE = sys.argv[3] if len(sys.argv) > 3 else "dns-benchmark.csv"
 
 results = []
 
-def query_resolver(resolver, domain, timeout):
-    """Query single resolver with timeout"""
+async def query_resolver_async(resolver, domain, timeout):
+    """Query single resolver with DoQ"""
     host = resolver.split(':')[0]
-    port = resolver.split(':')[1] if ':' in resolver else '853'
+    port = int(resolver.split(':')[1]) if ':' in resolver else 853
     
     start = time.perf_counter()
     try:
-        # Use dig with specific timeout and server
-        result = subprocess.run(
-            ['dig', f'@{host}', '-p', port, '+tcp', domain, '+timeout=2', '+tries=1'],
-            capture_output=True,
-            timeout=timeout,
-            text=True
-        )
-        elapsed = (time.perf_counter() - start) * 1000
-        
-        if 'NOERROR' in result.stdout or 'ANSWER SECTION' in result.stdout:
+        async with dns.quic.make_quic_connection(
+            host, port=port, timeout=timeout
+        ) as conn:
+            response = await conn.query(
+                dns.name.from_text(domain),
+                dns.rdatatype.A,
+                timeout=timeout
+            )
+            elapsed = (time.perf_counter() - start) * 1000
             return {'success': True, 'latency': elapsed, 'error': None}
-        else:
-            return {'success': False, 'latency': elapsed, 'error': 'NXDOMAIN/SERVFAIL'}
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         elapsed = (time.perf_counter() - start) * 1000
         return {'success': False, 'latency': elapsed, 'error': 'TIMEOUT'}
     except Exception as e:
         elapsed = (time.perf_counter() - start) * 1000
-        return {'success': False, 'latency': elapsed, 'error': str(e)[:30]}
+        error_msg = str(e)[:40]
+        return {'success': False, 'latency': elapsed, 'error': error_msg}
 
-def benchmark_resolver(resolver):
-    """Benchmark single resolver"""
+async def benchmark_resolver_async(resolver):
+    """Benchmark single resolver with parallel queries"""
     print(f"  Testing {resolver}...", end='', flush=True)
     
     timings = []
     failures = 0
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        for i in range(QUERIES):
-            domain = TEST_DOMAINS[i % len(TEST_DOMAINS)]
-            future = executor.submit(query_resolver, resolver, domain, TIMEOUT_S)
-            futures.append(future)
-        
-        for future in as_completed(futures):
-            result = future.result()
+    tasks = []
+    for i in range(QUERIES):
+        domain = TEST_DOMAINS[i % len(TEST_DOMAINS)]
+        task = query_resolver_async(resolver, domain, TIMEOUT_S)
+        tasks.append(task)
+    
+    # Run up to 5 concurrent queries
+    for task in asyncio.as_completed(tasks, timeout=TIMEOUT_S + 10):
+        try:
+            result = await task
             if result['success']:
                 timings.append(result['latency'])
             else:
                 failures += 1
+        except:
+            failures += 1
     
     success_count = len(timings)
     success_rate = (success_count / QUERIES) * 100 if QUERIES > 0 else 0
@@ -221,26 +219,32 @@ def benchmark_resolver(resolver):
     print(f" {success_count}/{QUERIES} | avg: {avg_ms:.1f}ms | p95: {p95_ms:.1f}ms")
     return result_dict
 
-# Run benchmarks
-for resolver in RESOLVERS:
-    result = benchmark_resolver(resolver)
-    results.append(result)
+async def run_all_benchmarks():
+    """Run benchmarks for all resolvers"""
+    for resolver in RESOLVERS:
+        result = await benchmark_resolver_async(resolver)
+        results.append(result)
+
+# Run async benchmarks
+asyncio.run(run_all_benchmarks())
 
 # Write CSV
 with open(RESULTS_FILE, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-    writer.writeheader()
-    writer.writerows(results)
+    writer = csv.DictWriter(f, fieldnames=results[0].keys() if results else [])
+    if results:
+        writer.writeheader()
+        writer.writerows(results)
 
 print(f"\n✓ Results exported to {RESULTS_FILE}")
 
 # Print summary table
-print("\n=== SUMMARY (sorted by avg latency) ===")
-sorted_results = sorted(results, key=lambda x: x['AvgMs'])
-print(f"{'Resolver':<30} {'Success':<10} {'AvgMs':<10} {'P95Ms':<10} {'StdevMs':<10}")
-print("-" * 70)
-for r in sorted_results[:10]:
-    print(f"{r['Resolver']:<30} {r['Success']}/{r['Queries']:<8} {r['AvgMs']:<10.2f} {r['P95Ms']:<10.2f} {r['StdevMs']:<10.2f}")
+if results:
+    print("\n=== SUMMARY (sorted by avg latency) ===")
+    sorted_results = sorted(results, key=lambda x: x['AvgMs'])
+    print(f"{'Resolver':<30} {'Success':<10} {'AvgMs':<10} {'P95Ms':<10} {'StdevMs':<10}")
+    print("-" * 70)
+    for r in sorted_results[:15]:
+        print(f"{r['Resolver']:<30} {r['Success']}/{r['Queries']:<8} {r['AvgMs']:<10.2f} {r['P95Ms']:<10.2f} {r['StdevMs']:<10.2f}")
 
 PYTHON_SCRIPT
 
@@ -248,14 +252,16 @@ PYTHON_SCRIPT
 echo ""
 echo -e "${BLUE}=== REACHABILITY SUMMARY ===${NC}"
 if [ -f "$REACHABILITY_FILE" ]; then
-    reachable=$(grep ",YES," "$REACHABILITY_FILE" | wc -l)
-    unreachable=$(grep ",NO," "$REACHABILITY_FILE" | wc -l)
+    reachable=$(grep ",YES," "$REACHABILITY_FILE" 2>/dev/null | wc -l)
+    unreachable=$(grep ",NO," "$REACHABILITY_FILE" 2>/dev/null | wc -l)
     echo -e "${GREEN}Reachable: $reachable${NC}"
     echo -e "${RED}Unreachable: $unreachable${NC}"
-    echo "Reachability details saved to: $REACHABILITY_FILE"
+    echo "Reachability details: $REACHABILITY_FILE"
 fi
 
 echo ""
 echo -e "${GREEN}✓ Benchmark complete!${NC}"
 echo "Results: $RESULTS_FILE"
-echo "Reachability: $REACHABILITY_FILE"
+echo ""
+echo "View results:"
+echo "  cat $RESULTS_FILE"
