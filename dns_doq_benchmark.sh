@@ -1,15 +1,12 @@
 #!/bin/bash
 
-# DNS DoQ Benchmark Script (Fixed - uses dnspython for proper DoQ)
-# Usage: bash dns_doq_benchmark.sh [queries] [concurrent_threads] [timeout_ms]
-# Default: 100 queries, 5 threads, 5000ms timeout
+# DNS DoQ Benchmark Script (using kdig)
+# Usage: bash dns_doq_benchmark.sh [queries] [concurrent_threads]
 
 QUERIES=${1:-100}
 THREADS=${2:-5}
-TIMEOUT_MS=${3:-5000}
 TEST_DOMAINS=("example.com" "google.com" "cloudflare.com")
 
-# Resolvers: 24 total (17 original + 7 new/additional)
 declare -a RESOLVERS=(
     "dns.adguard-dns.com"
     "dns.alidns.com:853"
@@ -37,9 +34,9 @@ declare -a RESOLVERS=(
 
 TIMESTAMP=$(date +%s)
 RESULTS_FILE="dns-benchmark-${TIMESTAMP}.csv"
-REACHABILITY_FILE="dns-reachability-${TIMESTAMP}.txt"
+TEMP_DIR="/tmp/dns-bench-$$"
+mkdir -p "$TEMP_DIR"
 
-# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -49,219 +46,137 @@ NC='\033[0m'
 echo -e "${BLUE}=== DNS DoQ Benchmark Suite ===${NC}"
 echo "Queries per resolver: $QUERIES"
 echo "Concurrent threads: $THREADS"
-echo "Timeout: ${TIMEOUT_MS}ms"
 echo ""
 
-# Check dependencies
-check_deps() {
-    echo -e "${BLUE}[*] Checking dependencies...${NC}"
-    
-    if ! command -v python3 &> /dev/null; then
-        echo -e "${RED}[!] python3 not found, installing...${NC}"
-        apt-get update -qq
-        apt-get install -y python3 python3-pip > /dev/null 2>&1
-    fi
-    
-    # Install dnspython
-    python3 -c "import dns.quic" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        echo -e "${YELLOW}[*] Installing dnspython...${NC}"
-        pip3 install dnspython --quiet
-    fi
-}
+# Install kdig if missing
+if ! command -v kdig &> /dev/null; then
+    echo -e "${YELLOW}[*] Installing knot-resolver...${NC}"
+    apt-get update -qq 2>/dev/null
+    apt-get install -y knot-resolver -qq 2>/dev/null
+fi
 
-check_deps
+echo -e "${BLUE}[*] Running benchmarks...${NC}"
+echo ""
 
-# Reachability check (UDP 853)
-echo -e "${BLUE}[*] Reachability check...${NC}"
-{
-    echo "Resolver,Reachable,Host,Port,Timestamp"
-    for resolver in "${RESOLVERS[@]}"; do
-        host="${resolver%:*}"
-        port="${resolver##*:}"
-        [[ "$port" == "$host" ]] && port="853"
+benchmark_resolver() {
+    local resolver=$1
+    local host="${resolver%:*}"
+    local port="${resolver##*:}"
+    [[ "$port" == "$host" ]] && port="853"
+    
+    local success=0
+    local failures=0
+    local timings=()
+    
+    # Run queries in parallel
+    for ((i=0; i<QUERIES; i++)); do
+        domain="${TEST_DOMAINS[$((i % ${#TEST_DOMAINS[@]}))]}"
         
-        timeout 2 bash -c "echo '' > /dev/udp/$host/$port" 2>/dev/null
-        if [ $? -eq 0 ]; then
-            echo -e "${GREEN}✓${NC} $host:$port"
-            echo "$resolver,YES,$host,$port,$TIMESTAMP" >> "$REACHABILITY_FILE"
-        else
-            echo -e "${RED}✗${NC} $host:$port"
-            echo "$resolver,NO,$host,$port,$TIMESTAMP" >> "$REACHABILITY_FILE"
+        (
+            start_ns=$(date +%s%N)
+            kdig +quic "@$host" -p "$port" "$domain" A +timeout=5 +tries=1 > /dev/null 2>&1
+            result=$?
+            end_ns=$(date +%s%N)
+            elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+            echo "$result:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
+        ) &
+        
+        # Limit concurrent jobs
+        if (( (i+1) % THREADS == 0 )); then
+            wait
         fi
     done
-} 2>/dev/null
-
-echo ""
-echo -e "${BLUE}[*] Running benchmarks (this may take a few minutes)...${NC}"
-echo ""
-
-# Python benchmark script using dnspython for proper DoQ
-python3 << 'PYTHON_SCRIPT'
-import asyncio
-import time
-import csv
-import sys
-from concurrent.futures import ThreadPoolExecutor
-from statistics import median, stdev, mean
-import dns.quic
-import dns.rdatatype
-import dns.name
-
-RESOLVERS = [
-    "dns.adguard-dns.com",
-    "dns.alidns.com:853",
-    "dns.caliph.dev:853",
-    "dns.comss.one",
-    "dns.dnsguard.pub",
-    "dns.jupitrdns.com",
-    "dns.surfsharkdns.com",
-    "doh.tiar.app",
-    "doq.ffmuc.net",
-    "family.adguard-dns.com",
-    "ibksturm.synology.me",
-    "juuri.hagezi.org",
-    "root.hagezi.org",
-    "router.comss.one",
-    "rx.techomespace.com",
-    "unfiltered.adguard-dns.com",
-    "wurzn.hagezi.org",
-    "dns.nextdns.io",
-    "dns0.eu",
-    "dns.cloudflare.com",
-    "one.one.one.one",
-    "dns.google"
-]
-
-TEST_DOMAINS = ["example.com", "google.com", "cloudflare.com"]
-QUERIES = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-TIMEOUT_MS = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-TIMEOUT_S = TIMEOUT_MS / 1000.0
-RESULTS_FILE = sys.argv[3] if len(sys.argv) > 3 else "dns-benchmark.csv"
-
-results = []
-
-async def query_resolver_async(resolver, domain, timeout):
-    """Query single resolver with DoQ"""
-    host = resolver.split(':')[0]
-    port = int(resolver.split(':')[1]) if ':' in resolver else 853
     
-    start = time.perf_counter()
-    try:
-        async with dns.quic.make_quic_connection(
-            host, port=port, timeout=timeout
-        ) as conn:
-            response = await conn.query(
-                dns.name.from_text(domain),
-                dns.rdatatype.A,
-                timeout=timeout
-            )
-            elapsed = (time.perf_counter() - start) * 1000
-            return {'success': True, 'latency': elapsed, 'error': None}
-    except asyncio.TimeoutError:
-        elapsed = (time.perf_counter() - start) * 1000
-        return {'success': False, 'latency': elapsed, 'error': 'TIMEOUT'}
-    except Exception as e:
-        elapsed = (time.perf_counter() - start) * 1000
-        error_msg = str(e)[:40]
-        return {'success': False, 'latency': elapsed, 'error': error_msg}
-
-async def benchmark_resolver_async(resolver):
-    """Benchmark single resolver with parallel queries"""
-    print(f"  Testing {resolver}...", end='', flush=True)
+    wait
     
-    timings = []
-    failures = 0
+    # Parse results
+    if [ -f "$TEMP_DIR/${resolver//\//-}.results" ]; then
+        local timings_arr=()
+        while IFS=: read -r exit_code elapsed; do
+            if [ "$exit_code" -eq 0 ]; then
+                ((success++))
+                timings_arr+=("$elapsed")
+            else
+                ((failures++))
+            fi
+        done < "$TEMP_DIR/${resolver//\//-}.results"
+        
+        # Calculate stats with awk
+        if [ ${#timings_arr[@]} -gt 0 ]; then
+            {
+                printf "%s\n" "${timings_arr[@]}"
+            } | awk -v q="$QUERIES" -v s="$success" '
+            {
+                sum += $1
+                count++
+                arr[count] = $1
+            }
+            END {
+                if (count > 0) {
+                    avg = sum / count
+                    
+                    # Variance for stdev
+                    for (i = 1; i <= count; i++) {
+                        diff = arr[i] - avg
+                        sq_sum += diff * diff
+                    }
+                    stdev = sqrt(sq_sum / count)
+                    
+                    # Bubble sort for percentiles
+                    for (i = 1; i <= count; i++) {
+                        for (j = i + 1; j <= count; j++) {
+                            if (arr[i] > arr[j]) {
+                                temp = arr[i]
+                                arr[i] = arr[j]
+                                arr[j] = temp
+                            }
+                        }
+                    }
+                    
+                    p50_idx = int(count * 0.50)
+                    p95_idx = int(count * 0.95)
+                    p99_idx = int(count * 0.99)
+                    if (p50_idx == 0) p50_idx = 1
+                    if (p95_idx == 0) p95_idx = 1
+                    if (p99_idx == 0) p99_idx = 1
+                    
+                    p50 = arr[p50_idx]
+                    p95 = arr[p95_idx]
+                    p99 = arr[p99_idx]
+                    
+                    success_rate = (s / q) * 100
+                    printf "%.2f,%.2f,%.2f,%.2f,%.2f,%.1f", avg, p50, p95, p99, stdev, success_rate
+                }
+            }' > "$TEMP_DIR/${resolver//\//-}.stats"
+        fi
+    fi
     
-    tasks = []
-    for i in range(QUERIES):
-        domain = TEST_DOMAINS[i % len(TEST_DOMAINS)]
-        task = query_resolver_async(resolver, domain, TIMEOUT_S)
-        tasks.append(task)
+    # Read calculated stats
+    local avg=0 p50=0 p95=0 p99=0 stdev=0 success_rate=0
+    if [ -f "$TEMP_DIR/${resolver//\//-}.stats" ]; then
+        IFS=',' read -r avg p50 p95 p99 stdev success_rate < "$TEMP_DIR/${resolver//\//-}.stats"
+    fi
     
-    # Run up to 5 concurrent queries
-    for task in asyncio.as_completed(tasks, timeout=TIMEOUT_S + 10):
-        try:
-            result = await task
-            if result['success']:
-                timings.append(result['latency'])
-            else:
-                failures += 1
-        except:
-            failures += 1
+    printf "[%-30s] %3d/%d | avg: %6.1fms | p95: %6.1fms | p99: %6.1fms\n" "$resolver" "$success" "$QUERIES" "$avg" "$p95" "$p99"
     
-    success_count = len(timings)
-    success_rate = (success_count / QUERIES) * 100 if QUERIES > 0 else 0
+    echo "$resolver,$QUERIES,$success,$failures,$success_rate,$avg,$p50,$p95,$p99,$stdev"
+}
+
+# CSV header + results
+{
+    echo "Resolver,Queries,Success,Failures,SuccessRate_%,AvgMs,P50Ms,P95Ms,P99Ms,StdevMs"
     
-    if timings:
-        avg_ms = mean(timings)
-        p50_ms = median(timings)
-        sorted_timings = sorted(timings)
-        p95_ms = sorted_timings[int(len(timings) * 0.95)] if len(timings) > 1 else timings[0]
-        p99_ms = sorted_timings[int(len(timings) * 0.99)] if len(timings) > 1 else timings[0]
-        stdev_ms = stdev(timings) if len(timings) > 1 else 0
-    else:
-        avg_ms = p50_ms = p95_ms = p99_ms = stdev_ms = 0
-    
-    result_dict = {
-        'Resolver': resolver,
-        'Queries': QUERIES,
-        'Success': success_count,
-        'Failures': failures,
-        'SuccessRate_%': round(success_rate, 1),
-        'AvgMs': round(avg_ms, 2),
-        'P50Ms': round(p50_ms, 2),
-        'P95Ms': round(p95_ms, 2),
-        'P99Ms': round(p99_ms, 2),
-        'StdevMs': round(stdev_ms, 2)
-    }
-    
-    print(f" {success_count}/{QUERIES} | avg: {avg_ms:.1f}ms | p95: {p95_ms:.1f}ms")
-    return result_dict
+    for resolver in "${RESOLVERS[@]}"; do
+        benchmark_resolver "$resolver"
+    done
+} | tee "$RESULTS_FILE"
 
-async def run_all_benchmarks():
-    """Run benchmarks for all resolvers"""
-    for resolver in RESOLVERS:
-        result = await benchmark_resolver_async(resolver)
-        results.append(result)
-
-# Run async benchmarks
-asyncio.run(run_all_benchmarks())
-
-# Write CSV
-with open(RESULTS_FILE, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=results[0].keys() if results else [])
-    if results:
-        writer.writeheader()
-        writer.writerows(results)
-
-print(f"\n✓ Results exported to {RESULTS_FILE}")
-
-# Print summary table
-if results:
-    print("\n=== SUMMARY (sorted by avg latency) ===")
-    sorted_results = sorted(results, key=lambda x: x['AvgMs'])
-    print(f"{'Resolver':<30} {'Success':<10} {'AvgMs':<10} {'P95Ms':<10} {'StdevMs':<10}")
-    print("-" * 70)
-    for r in sorted_results[:15]:
-        print(f"{r['Resolver']:<30} {r['Success']}/{r['Queries']:<8} {r['AvgMs']:<10.2f} {r['P95Ms']:<10.2f} {r['StdevMs']:<10.2f}")
-
-PYTHON_SCRIPT
-
-# Display reachability summary
-echo ""
-echo -e "${BLUE}=== REACHABILITY SUMMARY ===${NC}"
-if [ -f "$REACHABILITY_FILE" ]; then
-    reachable=$(grep ",YES," "$REACHABILITY_FILE" 2>/dev/null | wc -l)
-    unreachable=$(grep ",NO," "$REACHABILITY_FILE" 2>/dev/null | wc -l)
-    echo -e "${GREEN}Reachable: $reachable${NC}"
-    echo -e "${RED}Unreachable: $unreachable${NC}"
-    echo "Reachability details: $REACHABILITY_FILE"
-fi
+# Cleanup
+rm -rf "$TEMP_DIR"
 
 echo ""
 echo -e "${GREEN}✓ Benchmark complete!${NC}"
 echo "Results: $RESULTS_FILE"
 echo ""
-echo "View results:"
-echo "  cat $RESULTS_FILE"
+echo "Top 10 by latency:"
+tail -n +2 "$RESULTS_FILE" | sort -t',' -k6 -n | head -10 | awk -F',' '{printf "%-30s %7.2fms %7.2fms %6.1f%%\n", $1, $6, $8, $5}'
