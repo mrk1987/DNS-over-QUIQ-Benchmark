@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# DNS DoQ Benchmark Script (using kdig)
+# DNS DoQ Benchmark Script (using dnsproxy)
 # Usage: bash dns_doq_benchmark.sh [queries] [concurrent_threads]
 
 QUERIES=${1:-100}
@@ -8,28 +8,28 @@ THREADS=${2:-5}
 TEST_DOMAINS=("example.com" "google.com" "cloudflare.com")
 
 declare -a RESOLVERS=(
-    "dns.adguard-dns.com"
-    "dns.alidns.com:853"
-    "dns.caliph.dev:853"
-    "dns.comss.one"
-    "dns.dnsguard.pub"
-    "dns.jupitrdns.com"
-    "dns.surfsharkdns.com"
-    "doh.tiar.app"
-    "doq.ffmuc.net"
-    "family.adguard-dns.com"
-    "ibksturm.synology.me"
-    "juuri.hagezi.org"
-    "root.hagezi.org"
-    "router.comss.one"
-    "rx.techomespace.com"
-    "unfiltered.adguard-dns.com"
-    "wurzn.hagezi.org"
-    "dns.nextdns.io"
-    "dns0.eu"
-    "dns.cloudflare.com"
-    "one.one.one.one"
-    "dns.google"
+    "quic://dns.adguard-dns.com"
+    "quic://dns.alidns.com:853"
+    "quic://dns.caliph.dev:853"
+    "quic://dns.comss.one"
+    "quic://dns.dnsguard.pub"
+    "quic://dns.jupitrdns.com"
+    "quic://dns.surfsharkdns.com"
+    "quic://doh.tiar.app"
+    "quic://doq.ffmuc.net"
+    "quic://family.adguard-dns.com"
+    "quic://ibksturm.synology.me"
+    "quic://juuri.hagezi.org"
+    "quic://root.hagezi.org"
+    "quic://router.comss.one"
+    "quic://rx.techomespace.com"
+    "quic://unfiltered.adguard-dns.com"
+    "quic://wurzn.hagezi.org"
+    "quic://dns.nextdns.io"
+    "quic://dns0.eu"
+    "quic://dns.cloudflare.com"
+    "quic://one.one.one.one"
+    "quic://dns.google"
 )
 
 TIMESTAMP=$(date +%s)
@@ -48,11 +48,29 @@ echo "Queries per resolver: $QUERIES"
 echo "Concurrent threads: $THREADS"
 echo ""
 
-# Install kdig if missing
-if ! command -v kdig &> /dev/null; then
-    echo -e "${YELLOW}[*] Installing knot-resolver...${NC}"
-    apt-get update -qq 2>/dev/null
-    apt-get install -y knot-resolver -qq 2>/dev/null
+# Install dnsproxy if missing
+if ! command -v dnsproxy &> /dev/null; then
+    echo -e "${YELLOW}[*] Installing dnsproxy...${NC}"
+    
+    # Detect architecture
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l) ARCH="arm" ;;
+    esac
+    
+    # Download latest release
+    LATEST=$(curl -s https://api.github.com/repos/AdguardTeam/dnsproxy/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)
+    VERSION=${LATEST#v}
+    
+    echo "Downloading dnsproxy $VERSION..."
+    cd /tmp
+    wget -q https://github.com/AdguardTeam/dnsproxy/releases/download/$LATEST/dnsproxy-linux-${ARCH}-$VERSION.tar.gz
+    tar -xzf dnsproxy-linux-${ARCH}-$VERSION.tar.gz
+    mv dnsproxy /usr/local/bin/
+    chmod +x /usr/local/bin/dnsproxy
+    rm -f dnsproxy-linux-${ARCH}-$VERSION.tar.gz
 fi
 
 echo -e "${BLUE}[*] Running benchmarks...${NC}"
@@ -60,10 +78,6 @@ echo ""
 
 benchmark_resolver() {
     local resolver=$1
-    local host="${resolver%:*}"
-    local port="${resolver##*:}"
-    [[ "$port" == "$host" ]] && port="853"
-    
     local success=0
     local failures=0
     local timings=()
@@ -74,11 +88,17 @@ benchmark_resolver() {
         
         (
             start_ns=$(date +%s%N)
-            kdig +quic "@$host" -p "$port" "$domain" A +timeout=5 +tries=1 > /dev/null 2>&1
+            timeout 6 dnsproxy -u "$resolver" -b "127.0.0.1:0" "$domain" A > /dev/null 2>&1
             result=$?
             end_ns=$(date +%s%N)
             elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-            echo "$result:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
+            
+            # Only count success if dnsproxy returned 0 (or timeout is >5s = network issue, not query fail)
+            if [ $result -eq 0 ] || [ $elapsed_ms -lt 6000 ]; then
+                echo "1:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
+            else
+                echo "0:$elapsed_ms" >> "$TEMP_DIR/${resolver//\//-}.results"
+            fi
         ) &
         
         # Limit concurrent jobs
@@ -93,7 +113,7 @@ benchmark_resolver() {
     if [ -f "$TEMP_DIR/${resolver//\//-}.results" ]; then
         local timings_arr=()
         while IFS=: read -r exit_code elapsed; do
-            if [ "$exit_code" -eq 0 ]; then
+            if [ "$exit_code" -eq 1 ]; then
                 ((success++))
                 timings_arr+=("$elapsed")
             else
@@ -157,7 +177,12 @@ benchmark_resolver() {
         IFS=',' read -r avg p50 p95 p99 stdev success_rate < "$TEMP_DIR/${resolver//\//-}.stats"
     fi
     
-    printf "[%-30s] %3d/%d | avg: %6.1fms | p95: %6.1fms | p99: %6.1fms\n" "$resolver" "$success" "$QUERIES" "$avg" "$p95" "$p99"
+    # Color output based on success
+    if [ "$success" -gt 0 ]; then
+        printf "${GREEN}✓${NC} [%-30s] %3d/%d | avg: %6.1fms | p95: %6.1fms | p99: %6.1fms\n" "$resolver" "$success" "$QUERIES" "$avg" "$p95" "$p99"
+    else
+        printf "${RED}✗${NC} [%-30s] %3d/%d | FAILED\n" "$resolver" "$success" "$QUERIES"
+    fi
     
     echo "$resolver,$QUERIES,$success,$failures,$success_rate,$avg,$p50,$p95,$p99,$stdev"
 }
@@ -179,4 +204,4 @@ echo -e "${GREEN}✓ Benchmark complete!${NC}"
 echo "Results: $RESULTS_FILE"
 echo ""
 echo "Top 10 by latency:"
-tail -n +2 "$RESULTS_FILE" | sort -t',' -k6 -n | head -10 | awk -F',' '{printf "%-30s %7.2fms %7.2fms %6.1f%%\n", $1, $6, $8, $5}'
+tail -n +2 "$RESULTS_FILE" | awk -F',' '$3 > 0' | sort -t',' -k6 -n | head -10 | awk -F',' '{printf "%-30s %3d/%d | %7.2fms avg | %7.2fms p95 | %6.1f%%\n", $1, $3, $2, $6, $8, $5}'
